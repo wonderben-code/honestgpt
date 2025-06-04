@@ -1,342 +1,204 @@
-import express from 'express';
-import { performWebSearch } from '../services/searchService.js';
-import { calculateConfidence, detectTopic } from '../services/confidenceService.js';
-import { generateAIResponse, generateNoResultsResponse } from '../services/aiService.js';
-import { authenticateToken } from '../middleware/auth.js';
-import { createRateLimiter } from '../middleware/rateLimiter.js';
-import { trackUsage } from '../services/usageService.js';
-import { getConversationContext } from '../services/conversationService.js';
-import Joi from 'joi';
-import winston from 'winston';
-
+const express = require('express');
 const router = express.Router();
+const { chatAuthMiddleware } = require('../middleware/auth');
+const { pool } = require('../db/config');
+const openai = require('../services/openaiService');
+const searchService = require('../services/searchService');
 
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.json(),
-  defaultMeta: { service: 'chat-routes' },
-});
+// Send a message and get AI response
+router.post('/message', chatAuthMiddleware, async (req, res) => {
+  const { message, conversationId } = req.body;
+  const userId = req.user.id;
 
-// Request validation schema
-const chatRequestSchema = Joi.object({
-  message: Joi.string().min(1).max(1000).required(),
-  conversationId: Joi.string().uuid().optional(),
-  searchOnly: Joi.boolean().optional(),
-});
-
-// Apply authentication to all chat routes
-router.use(authenticateToken);
-
-// Apply rate limiting based on user tier
-router.use(async (req, res, next) => {
   try {
-    const tier = req.user.tier || 'free';
-    let limiter;
-    
-    switch (tier) {
-      case 'free':
-        limiter = createRateLimiter(10, 30); // 10 requests per 30 days
-        break;
-      case 'pro':
-        limiter = createRateLimiter(200, 30); // 200 per month
-        break;
-      case 'team':
-        limiter = createRateLimiter(1000, 30); // 1000 per month
-        break;
-      default:
-        limiter = createRateLimiter(10, 30);
+    // Validate input
+    if (!message || message.trim().length === 0) {
+      return res.status(400).json({ error: 'Message is required' });
     }
-    
-    limiter(req, res, next);
-  } catch (error) {
-    next(error);
-  }
-});
 
-/**
- * Main chat endpoint - generates AI response with confidence scores
- */
-router.post('/message', async (req, res) => {
-  try {
-    // Validate request
-    const { error, value } = chatRequestSchema.validate(req.body);
-    if (error) {
-      return res.status(400).json({ 
-        error: 'Invalid request', 
-        details: error.details[0].message 
-      });
+    // Create or get conversation
+    let convId = conversationId;
+    if (!convId) {
+      // Create new conversation
+      const convResult = await pool.query(
+        'INSERT INTO conversations (user_id, title, created_at) VALUES ($1, $2, NOW()) RETURNING id',
+        [userId, message.substring(0, 100)]
+      );
+      convId = convResult.rows[0].id;
     }
-    
-    const { message, conversationId, searchOnly } = value;
-    const userId = req.user.id;
-    
-    logger.info('Chat request received', { 
-      userId, 
-      messageLength: message.length,
-      conversationId 
-    });
-    
-    // Check usage limits
-    const canProceed = await trackUsage(userId, 'chat');
-    if (!canProceed.allowed) {
-      return res.status(429).json({ 
-        error: 'Usage limit exceeded',
-        limit: canProceed.limit,
-        used: canProceed.used,
-        resetDate: canProceed.resetDate,
-      });
-    }
-    
-    // Step 1: Detect topic for better search and confidence calculation
-    const topic = detectTopic(message);
-    
-    // Step 2: Perform web search
-    const searchResults = await performWebSearch(message);
-    
-    if (!searchResults.success || searchResults.results.length === 0) {
-      logger.warn('No search results found', { message: message.substring(0, 50) });
-      
-      if (searchOnly) {
-        return res.json({
-          success: false,
-          message: 'No search results found',
-          results: [],
-        });
-      }
-      
-      // Generate no-results response
-      const response = generateNoResultsResponse(message);
-      return res.json(response);
-    }
-    
-    // Step 3: Calculate confidence based on search results
-    const confidenceBreakdown = await calculateConfidence(
-      searchResults.results,
-      message,
-      topic
+
+    // Save user message
+    await pool.query(
+      'INSERT INTO messages (conversation_id, role, content, created_at) VALUES ($1, $2, $3, NOW())',
+      [convId, 'user', message]
     );
-    
-    // If search only mode, return search results with confidence
-    if (searchOnly) {
-      return res.json({
-        success: true,
-        searchResults: searchResults.results,
-        confidence: confidenceBreakdown,
-        metadata: searchResults.metadata,
-      });
-    }
-    
-    // Step 4: Get conversation context if conversationId provided
-    let conversationContext = '';
-    if (conversationId) {
-      conversationContext = await getConversationContext(conversationId, userId);
-    }
-    
-    // Step 5: Generate AI response
-    const aiResponse = await generateAIResponse(
-      message,
-      searchResults.results,
-      confidenceBreakdown,
-      conversationContext
+
+    // Perform web search
+    const searchResults = await searchService.search(message);
+
+    // Generate AI response with search results
+    const aiResponse = await openai.generateResponse(message, searchResults);
+
+    // Calculate confidence score based on search results
+    const confidenceScore = calculateConfidenceScore(searchResults, aiResponse);
+
+    // Save AI response
+    const aiMessageResult = await pool.query(
+      `INSERT INTO messages (conversation_id, role, content, confidence_score, sources, created_at) 
+       VALUES ($1, $2, $3, $4, $5, NOW()) 
+       RETURNING id, content, confidence_score, sources`,
+      [convId, 'assistant', aiResponse.content, confidenceScore, JSON.stringify(aiResponse.sources)]
     );
-    
-    if (!aiResponse.success) {
-      logger.error('AI response generation failed', { 
-        error: aiResponse.error,
-        userId 
-      });
-      return res.status(500).json({
-        error: 'Failed to generate response',
-        fallback: aiResponse.fallbackResponse,
-      });
-    }
-    
-    // Step 6: Save conversation to database
-    if (conversationId) {
-      await saveMessage(conversationId, userId, message, aiResponse.response);
-    }
-    
-    // Step 7: Track token usage for billing
-    await trackTokenUsage(userId, aiResponse.metadata);
-    
-    // Return complete response
+
+    // Log usage
+    await pool.query(
+      'INSERT INTO usage_logs (user_id, action, tokens_used, created_at) VALUES ($1, $2, $3, NOW())',
+      [userId, 'chat_message', aiResponse.tokensUsed || 0]
+    );
+
     res.json({
-      success: true,
-      response: aiResponse.response,
-      metadata: {
-        ...aiResponse.metadata,
-        topic,
-        searchMetadata: searchResults.metadata,
-      },
+      conversationId: convId,
+      message: aiMessageResult.rows[0],
+      confidenceScore,
+      sources: aiResponse.sources
     });
-    
   } catch (error) {
-    logger.error('Chat endpoint error', { 
-      error: error.message,
-      stack: error.stack,
-      userId: req.user?.id,
-    });
-    
-    res.status(500).json({
-      error: 'An error occurred processing your request',
-      message: 'Please try again. If the problem persists, contact support.',
-    });
+    console.error('Chat error:', error);
+    res.status(500).json({ error: 'Failed to process message' });
   }
 });
 
-/**
- * Get conversation history
- */
-router.get('/conversation/:conversationId', async (req, res) => {
+// Get user's conversations
+router.get('/conversations', chatAuthMiddleware, async (req, res) => {
+  const userId = req.user.id;
+
   try {
-    const { conversationId } = req.params;
-    const userId = req.user.id;
-    
-    const conversation = await getConversation(conversationId, userId);
-    
-    if (!conversation) {
+    const result = await pool.query(
+      `SELECT c.id, c.title, c.created_at, c.updated_at,
+              COUNT(m.id) as message_count,
+              MAX(m.created_at) as last_message_at
+       FROM conversations c
+       LEFT JOIN messages m ON c.id = m.conversation_id
+       WHERE c.user_id = $1
+       GROUP BY c.id
+       ORDER BY COALESCE(MAX(m.created_at), c.created_at) DESC
+       LIMIT 50`,
+      [userId]
+    );
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching conversations:', error);
+    res.status(500).json({ error: 'Failed to fetch conversations' });
+  }
+});
+
+// Get specific conversation with messages
+router.get('/conversation/:id', chatAuthMiddleware, async (req, res) => {
+  const userId = req.user.id;
+  const conversationId = req.params.id;
+
+  try {
+    // Verify conversation belongs to user
+    const convResult = await pool.query(
+      'SELECT id, title, created_at FROM conversations WHERE id = $1 AND user_id = $2',
+      [conversationId, userId]
+    );
+
+    if (convResult.rows.length === 0) {
       return res.status(404).json({ error: 'Conversation not found' });
     }
-    
+
+    // Get messages
+    const messagesResult = await pool.query(
+      'SELECT id, role, content, confidence_score, sources, created_at FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC',
+      [conversationId]
+    );
+
     res.json({
-      success: true,
-      conversation,
+      conversation: convResult.rows[0],
+      messages: messagesResult.rows.map(msg => ({
+        ...msg,
+        sources: msg.sources ? JSON.parse(msg.sources) : []
+      }))
     });
-    
   } catch (error) {
-    logger.error('Get conversation error', { error: error.message });
-    res.status(500).json({ error: 'Failed to retrieve conversation' });
+    console.error('Error fetching conversation:', error);
+    res.status(500).json({ error: 'Failed to fetch conversation' });
   }
 });
 
-/**
- * Create new conversation
- */
-router.post('/conversation', async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { title } = req.body;
-    
-    const conversation = await createConversation(userId, title);
-    
-    res.json({
-      success: true,
-      conversation,
-    });
-    
-  } catch (error) {
-    logger.error('Create conversation error', { error: error.message });
-    res.status(500).json({ error: 'Failed to create conversation' });
-  }
-});
+// Delete conversation
+router.delete('/conversation/:id', chatAuthMiddleware, async (req, res) => {
+  const userId = req.user.id;
+  const conversationId = req.params.id;
 
-/**
- * List user's conversations
- */
-router.get('/conversations', async (req, res) => {
   try {
-    const userId = req.user.id;
-    const { page = 1, limit = 20 } = req.query;
-    
-    const conversations = await listConversations(userId, page, limit);
-    
-    res.json({
-      success: true,
-      conversations,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-      },
-    });
-    
-  } catch (error) {
-    logger.error('List conversations error', { error: error.message });
-    res.status(500).json({ error: 'Failed to list conversations' });
-  }
-});
+    // Verify conversation belongs to user and delete
+    const result = await pool.query(
+      'DELETE FROM conversations WHERE id = $1 AND user_id = $2 RETURNING id',
+      [conversationId, userId]
+    );
 
-/**
- * Delete conversation
- */
-router.delete('/conversation/:conversationId', async (req, res) => {
-  try {
-    const { conversationId } = req.params;
-    const userId = req.user.id;
-    
-    await deleteConversation(conversationId, userId);
-    
-    res.json({
-      success: true,
-      message: 'Conversation deleted',
-    });
-    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    res.json({ message: 'Conversation deleted successfully' });
   } catch (error) {
-    logger.error('Delete conversation error', { error: error.message });
+    console.error('Error deleting conversation:', error);
     res.status(500).json({ error: 'Failed to delete conversation' });
   }
 });
 
-/**
- * Export conversation
- */
-router.get('/conversation/:conversationId/export', async (req, res) => {
-  try {
-    const { conversationId } = req.params;
-    const userId = req.user.id;
-    const { format = 'json' } = req.query;
-    
-    // Check if user has export permission (pro/team tier)
-    if (!['pro', 'team'].includes(req.user.tier)) {
-      return res.status(403).json({ 
-        error: 'Export feature requires Pro or Team subscription' 
-      });
-    }
-    
-    const exportData = await exportConversation(conversationId, userId, format);
-    
-    if (format === 'json') {
-      res.json(exportData);
-    } else if (format === 'markdown') {
-      res.setHeader('Content-Type', 'text/markdown');
-      res.setHeader('Content-Disposition', `attachment; filename="conversation-${conversationId}.md"`);
-      res.send(exportData);
-    } else {
-      res.status(400).json({ error: 'Invalid export format' });
-    }
-    
-  } catch (error) {
-    logger.error('Export conversation error', { error: error.message });
-    res.status(500).json({ error: 'Failed to export conversation' });
+// Helper function to calculate confidence score
+function calculateConfidenceScore(searchResults, aiResponse) {
+  let score = 0;
+  let factors = 0;
+
+  // Factor 1: Number of quality sources
+  if (searchResults && searchResults.length > 0) {
+    const qualitySources = searchResults.filter(s => 
+      s.url.includes('.gov') || 
+      s.url.includes('.edu') || 
+      s.url.includes('pubmed') ||
+      s.url.includes('scholar')
+    );
+    score += (qualitySources.length / searchResults.length) * 30;
+    factors++;
   }
-});
 
-// Placeholder functions - these would be implemented in separate service files
-async function saveMessage(conversationId, userId, message, response) {
-  // Implementation would save to database
+  // Factor 2: Source consensus
+  if (aiResponse.sources && aiResponse.sources.length > 2) {
+    score += 25;
+    factors++;
+  }
+
+  // Factor 3: Recency of sources
+  const recentSources = searchResults.filter(s => {
+    const date = new Date(s.publishedDate);
+    const yearAgo = new Date();
+    yearAgo.setFullYear(yearAgo.getFullYear() - 1);
+    return date > yearAgo;
+  });
+  if (recentSources.length > 0) {
+    score += (recentSources.length / searchResults.length) * 20;
+    factors++;
+  }
+
+  // Factor 4: AI response certainty
+  const uncertainPhrases = ['might be', 'could be', 'possibly', 'unclear', 'uncertain'];
+  const hasUncertainty = uncertainPhrases.some(phrase => 
+    aiResponse.content.toLowerCase().includes(phrase)
+  );
+  if (!hasUncertainty) {
+    score += 25;
+    factors++;
+  }
+
+  // Calculate final score
+  const finalScore = factors > 0 ? Math.round(score) : 50;
+  return Math.min(100, Math.max(0, finalScore));
 }
 
-async function trackTokenUsage(userId, metadata) {
-  // Implementation would track usage for billing
-}
-
-async function getConversation(conversationId, userId) {
-  // Implementation would fetch from database
-}
-
-async function createConversation(userId, title) {
-  // Implementation would create in database
-}
-
-async function listConversations(userId, page, limit) {
-  // Implementation would fetch from database with pagination
-}
-
-async function deleteConversation(conversationId, userId) {
-  // Implementation would delete from database
-}
-
-async function exportConversation(conversationId, userId, format) {
-  // Implementation would export conversation data
-}
-
-export default router;
+module.exports = router;
